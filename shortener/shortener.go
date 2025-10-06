@@ -7,14 +7,72 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/url"
+	"strings"
 )
 
-func HandleShortneURLRequest(longUrl string, db *sql.DB) (string, error) {
-	// First check if the long URL is already in the database
-	shortKey, err := CheckDbForLongURL(context.Background(), db, longUrl)
-	// if not generate the short URL and save it to the database
+const (
+	// Conservative limit from broad compatibility, can be configured to 8192 or higher
+	// based on client needs and server configuration
+	MaxURLLength = 2048
+)
 
-	// return the short URL
+// ValidateLongURL checks whether the provided longURL is a valid and safe URL for use in the URL shortener service.
+// It performs the following validations:
+//   - Ensures the URL does not exceed 2048 characters.
+//   - Checks that the URL is properly formatted and parsable.
+//   - Verifies that the URL uses either the "http" or "https" scheme.
+//   - Prevents Server-Side Request Forgery (SSRF) by disallowing URLs pointing to localhost, 127.0.0.1, or 0.0.0.0.
+//
+// Returns an error if any validation fails, or nil if the URL is valid.
+func ValidateLongURL(longURL string) error {
+	// Length check - prevent extremely long URLs
+	if len(longURL) > MaxURLLength {
+		return fmt.Errorf("URL exceeds maximum length of %d characters", MaxLength)
+	}
+
+	// Validate URL structure
+	parsedURL, err := url.Parse(longURL)
+	if err != nil {
+		return fmt.Errorf("Invalid URL format %w", err)
+	}
+
+	// Check if longURL has a valid scheme for XSS protection
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return fmt.Errorf("URL must use http or https scheme")
+	}
+
+	//SSRF Portection
+	host := strings.ToLower(parsedURL.Host)
+	if strings.Contains(host, "localhost") ||
+		strings.Contains(host, "127.0.0.1") ||
+		strings.Contains(host, "0.0.0.0") {
+		return fmt.Errorf("Internal URLs are not allowed")
+	}
+
+	return nil
+}
+
+func HandleShortURLRequest(longUrl string, db *sql.DB) (string, error) {
+	// Validate the input to catch and prevent XSS and SSRF attacks
+	if err := ValidateLongURL(longUrl); err != nil {
+		return "", fmt.Errorf("Validation failed: %w", err)
+	}
+
+	// Check if the longURL has already been shortened (dedup)
+	shortKey, err := CheckDbForLongURL(context.Background(), db, longUrl)
+	if err != nil {
+		return "", fmt.Errorf("Database lookup failed: %w", err)
+	}
+
+	//If exists, return existing shortened URL
+	if shortKey != "" {
+		shortenedURL, err := generateFullShortURL(shortKey)
+
+		if err == nil {
+			return shortenedURL, err
+		}
+	}
+	return "", fmt.Errorf("Failed to construct full short URL.")
 }
 
 // GenerateShortURLKey creates a short, URL-safe key from a long URL.
@@ -40,22 +98,18 @@ func generateShortURLKey(longUrl string) string {
 	return encoded[:7]
 }
 
-// GenerateFullShortURL constructs the complete short URL by prepending a base domain
-// to the generated short key.
-// It takes the original long URL as input and returns the full short URL string.
-func generateFullShortURL(longUrl string) (string, error) {
+// generateFullShortURL constructs the full shortened URL by joining the base domain
+// with the provided shortKey. It uses url.JoinPath to ensure the URL is formed
+// correctly, handling any trailing or leading slashes. Returns the complete short URL
+// as a string, or an error if URL construction fails.
+func generateFullShortURL(shortKey string) (string, error) {
 	baseDomain := "http://shan747.urs/"
-	shortKey := generateShortURLKey(longUrl)
-
-	if shortKey == "encoded string too short" {
-		return "", fmt.Errorf("failed to generate short key")
-	}
 
 	// Use url.JoinPath for robust URL construction. This correctly handles
 	// joining the domain and key, regardless of trailing slashes.
 	fullURL, err := url.JoinPath(baseDomain, shortKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to construct full short URL: %w", err)
+		return "", fmt.Errorf("Failed to construct full short URL: %w", err)
 	}
 	return fullURL, nil
 }
