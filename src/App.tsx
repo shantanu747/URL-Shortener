@@ -7,7 +7,26 @@ function App() {
     const [error, setError] = useState('');
 
     const handleShorten = async () => {
+        try {
+            const response = await fetch('/api/v1/shorten', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({long_url: longUrl}),
+            });
 
+            if (!response.ok) {
+                throw new Error('Failed to shorten URL');
+            }
+
+            const data = await response.json();
+            setShortUrl(data.short_url);
+            setError('');
+        } catch (err) {
+            setError("Error shortening URL");
+            console.error(err);
+        }
     };
 
     return (
@@ -21,6 +40,8 @@ function App() {
             />
             <button onClick={handleShorten}>Shorten</button>
 
+            {shortUrl && <div>Short URL: <a href={shortUrl}>{shortUrl}</a></div>}
+            {error && <div style={{ color: 'red' }}>{error}</div>}
         </div>
     );
 }
