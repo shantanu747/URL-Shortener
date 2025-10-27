@@ -2,11 +2,15 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
+
+	"github.com/shantanu747/URL-Shortener/shortener"
 
 	"github.com/joho/godotenv"
 	"github.com/lib/pq"
@@ -18,12 +22,105 @@ type Store struct {
 	db *sql.DB
 }
 
+type ShortenRequest struct {
+	LongURL string `json:"long_url"`
+}
+
+type ShortenResponse struct {
+	ShortURL string `json:"short_url"`
+	Error    string `json:"error,omitempty"`
+}
+
 func (s *Store) handleShorten(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "This is the shorten endpoint. it will accept a long URL and return a short one.")
+	// Only accept POST requests
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the JSON request body
+	var req ShortenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ShortenResponse{
+			Error: "Invalid JSON format",
+		})
+		return
+	}
+
+	// Validate that long_url field is not empty
+	if req.LongURL == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ShortenResponse{
+			Error: "long_url field is required",
+		})
+		return
+	}
+
+	// Call the shortener logic
+	shortURL, err := shortener.HandleShortURLRequest(req.LongURL, s.db)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ShortenResponse{
+			Error: err.Error(),
+		})
+		return
+	}
+
+	// Return success response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(ShortenResponse{
+		ShortURL: shortURL,
+	})
 }
 
 func (s *Store) handleRedirect(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "This is the redirect endpoint. it will accept a short URL and return a long one.")
+	//path validation
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Extract the short key from the URL path
+	shortKey := r.URL.Path[1:] // Remove leading "/"
+
+	//validate shortKey before database lookup
+	if shortKey == "" {
+		http.Error(w, "short key required", http.StatusNotFound)
+		return
+	}
+
+	// Validate characters (should only be base64 URL-safe characters)
+	for _, char := range shortKey {
+		if !((char >= 'A' && char <= 'Z') ||
+			(char >= 'a' && char <= 'z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_') {
+			http.Error(w, "invalid short key format", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Call HandleRedirectRequest with proper arguments
+	longURL, err := shortener.HandleRedirectRequest(r.Context(), s.db, shortKey)
+	if err != nil {
+		//Check error type to determine proper status code
+		if strings.Contains(err.Error(), "invalid short key length") {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		} else if strings.Contains(err.Error(), "not found") {
+			http.Error(w, err.Error(), http.StatusNotFound)
+		} else {
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Redirect to the long URL
+	http.Redirect(w, r, longURL, http.StatusFound)
 }
 
 func main() {
@@ -35,7 +132,7 @@ func main() {
 
 	// Read database configuration from environment variables
 	host := os.Getenv("DB_HOST")
-	port := os.Getenv("DB_PORT")
+	db_port := os.Getenv("DB_PORT")
 	user := os.Getenv("DB_USER")
 	password := os.Getenv("DB_PASSWORD")
 	dbname := os.Getenv("DB_NAME")
@@ -43,7 +140,7 @@ func main() {
 	// Construct the connection string
 	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s "+
 		"password=%s dbname=%s sslmode=disable",
-		host, port, user, password, dbname)
+		host, db_port, user, password, dbname)
 
 	// Open a connection to the database
 	db, err := sql.Open("postgres", psqlInfo)
@@ -86,4 +183,14 @@ func main() {
 
 	// Handle the API endpoint for redirecting to the long URL
 	mux.HandleFunc("/", store.handleRedirect)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	serverAddr := fmt.Sprintf(":%s", port)
+	log.Printf("Starting server on %s", serverAddr)
+	log.Fatal(http.ListenAndServe(serverAddr, mux))
+
 }
